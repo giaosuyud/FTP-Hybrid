@@ -54,7 +54,6 @@ def load_users():
 
             os.makedirs(home_path, exist_ok=True)
 
-        print(f"Loaded {len(users)} FTP user(s) from: {USER_FILE}")
         return users
 
     except FileNotFoundError:
@@ -72,11 +71,6 @@ def load_users():
 
 USERS = load_users()
 
-print("========== USER DEBUG ==========")
-print("USER_FILE:", USER_FILE)
-print("USERS:", USERS)
-print("USERNAMES:", list(USERS.keys()))
-print("================================")
 
 # UDP Reliable Layer Configuration
 UDP_BUFFER_SIZE = 1024        # Maximum UDP packet payload
@@ -125,150 +119,519 @@ class FTPResponse:
 # ================================================================
 class ReliableUDP:
     """
-    Custom reliable UDP protocol implementation with:
-    - Sequence numbers for ordering
-    - ACK mechanism
-    - Timeout and retransmission
-    - Checksum for data integrity
+    Reliable UDP data channel.
+
+    Packet header: 12 bytes
+
+    Sequence : 2 bytes
+    ACK      : 2 bytes
+    Flags    : 1 byte
+    Length   : 2 bytes
+    Checksum : 2 bytes
+    Reserved : 3 bytes
+
+    Flags:
+        0x01 = ACK
+        0x02 = FIN
+        0x04 = DATA
+        0x08 = HELLO
     """
 
-    def __init__(self, host, port):
-        # Create UDP socket
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    FLAG_ACK = 0x01
+    FLAG_FIN = 0x02
+    FLAG_DATA = 0x04
+    FLAG_HELLO = 0x08
+
+    HEADER_SIZE = 12
+
+    def __init__(self, host, port=0):
+        self.sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_DGRAM
+        )
+
+        self.sock.setsockopt(
+            socket.SOL_SOCKET,
+            socket.SO_REUSEADDR,
+            1
+        )
+
         self.sock.bind((host, port))
+
         self.sock.settimeout(UDP_TIMEOUT)
+
         self.local_port = self.sock.getsockname()[1]
-        self.peer_addr: Optional[Tuple[str, int]] = None
+
+        self.peer_addr = None
+
         self.sequence = 0
+
         self.lock = threading.Lock()
 
+    # ============================================================
+    # CHECKSUM
+    # ============================================================
+
     def calculate_checksum(self, data: bytes) -> int:
-        """Calculate checksum for data integrity verification"""
+        """Calculate 16-bit checksum."""
+
         checksum = 0
+
         for i in range(0, len(data), 2):
+
             if i + 1 < len(data):
-                checksum += (data[i] << 8) + data[i + 1]
+                checksum += (
+                    (data[i] << 8)
+                    | data[i + 1]
+                )
             else:
-                checksum += data[i] << 8
+                checksum += (
+                    data[i] << 8
+                )
+
         while checksum > 0xffff:
-            checksum = (checksum >> 16) + (checksum & 0xffff)
+            checksum = (
+                (checksum >> 16)
+                + (checksum & 0xffff)
+            )
+
         return checksum & 0xffff
 
-    def create_packet(self, sequence: int, ack: int, flags: int, payload: bytes = b""):
-        """
-        Create reliable UDP packet with custom header (12 bytes)
-        - Sequence number (2 bytes)
-        - ACK number (2 bytes)
-        - Flags (1 byte): 0=ACK, 1=FIN, 2=SYN
-        - Payload length (2 bytes)
-        - Checksum (2 bytes)
-        - Reserved (3 bytes)
-        """
-        checksum = self.calculate_checksum(payload)
-        header = (
-            sequence.to_bytes(2, 'big') +
-            ack.to_bytes(2, 'big') +
-            bytes([flags]) +
-            len(payload).to_bytes(2, 'big') +
-            checksum.to_bytes(2, 'big') +
-            b'\x00' * 3
+    # ============================================================
+    # PACKET CREATION
+    # ============================================================
+
+    def create_packet(
+        self,
+        sequence,
+        ack=0,
+        flags=0,
+        payload=b""
+    ):
+        """Create UDP packet."""
+
+        if len(payload) > UDP_BUFFER_SIZE:
+            raise ValueError(
+                "Payload too large"
+            )
+
+        sequence = sequence & 0xffff
+        ack = ack & 0xffff
+
+        checksum = self.calculate_checksum(
+            payload
         )
+
+        header = (
+            sequence.to_bytes(2, "big")
+            + ack.to_bytes(2, "big")
+            + bytes([flags])
+            + len(payload).to_bytes(2, "big")
+            + checksum.to_bytes(2, "big")
+            + b"\x00" * 3
+        )
+
         return header + payload
 
-    def parse_packet(self, data: bytes):
-        """Parse reliable UDP packet, return (seq, ack, flags, payload, is_valid)"""
-        if len(data) < 12:
-            return None, None, None, None, False
-        try:
-            sequence = int.from_bytes(data[0:2], 'big')
-            ack = int.from_bytes(data[2:4], 'big')
-            flags = data[4]
-            payload_length = int.from_bytes(data[5:7], 'big')
-            received_checksum = int.from_bytes(data[7:9], 'big')
-            payload = data[12:12 + payload_length] if payload_length > 0 else b""
-            calculated_checksum = self.calculate_checksum(payload)
-            is_valid = (received_checksum == calculated_checksum)
-            return sequence, ack, flags, payload, is_valid
-        except Exception:
-            return None, None, None, None, False
+    # ============================================================
+    # PACKET PARSING
+    # ============================================================
 
-    def send_packet(self, sequence: int, payload: bytes = b""):
-        """Send packet with retransmission until ACK received"""
-        packet = self.create_packet(sequence, 0, 0x04, payload)
+    def parse_packet(self, data):
+        """
+        Parse packet.
+
+        Returns:
+            sequence,
+            ack,
+            flags,
+            payload,
+            is_valid
+        """
+
+        if len(data) < self.HEADER_SIZE:
+            return (
+                None,
+                None,
+                None,
+                b"",
+                False
+            )
+
+        try:
+
+            sequence = int.from_bytes(
+                data[0:2],
+                "big"
+            )
+
+            ack = int.from_bytes(
+                data[2:4],
+                "big"
+            )
+
+            flags = data[4]
+
+            payload_length = int.from_bytes(
+                data[5:7],
+                "big"
+            )
+
+            received_checksum = int.from_bytes(
+                data[7:9],
+                "big"
+            )
+
+            if payload_length > UDP_BUFFER_SIZE:
+                return (
+                    None,
+                    None,
+                    None,
+                    b"",
+                    False
+                )
+
+            if len(data) < (
+                self.HEADER_SIZE
+                + payload_length
+            ):
+                return (
+                    None,
+                    None,
+                    None,
+                    b"",
+                    False
+                )
+
+            payload = data[
+                self.HEADER_SIZE:
+                self.HEADER_SIZE + payload_length
+            ]
+
+            calculated_checksum = (
+                self.calculate_checksum(payload)
+            )
+
+            is_valid = (
+                received_checksum
+                == calculated_checksum
+            )
+
+            return (
+                sequence,
+                ack,
+                flags,
+                payload,
+                is_valid
+            )
+
+        except Exception:
+            return (
+                None,
+                None,
+                None,
+                b"",
+                False
+            )
+
+    # ============================================================
+    # SEND ACK
+    # ============================================================
+
+    def send_ack(self, ack_number):
+        """Send ACK."""
+
         if self.peer_addr is None:
             return False
-        for _ in range(UDP_MAX_RETRIES):
+
+        packet = self.create_packet(
+            sequence=0,
+            ack=ack_number,
+            flags=self.FLAG_ACK
+        )
+
+        try:
+
+            self.sock.sendto(
+                packet,
+                self.peer_addr
+            )
+
+            return True
+
+        except Exception:
+            return False
+
+    # ============================================================
+    # WAIT FOR UDP PEER
+    # ============================================================
+
+    def wait_for_hello(self, timeout=10):
+        """Wait for client HELLO and establish UDP peer."""
+        old_timeout = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        try:
+            while True:
+                data, addr = self.sock.recvfrom(
+                    UDP_BUFFER_SIZE + self.HEADER_SIZE + 64
+                )
+                parsed = self.parse_packet(data)
+                if parsed is None:
+                    continue
+                sequence, ack, flags, payload, valid = parsed
+                if not valid:
+                    continue
+                if flags & self.FLAG_HELLO:
+                    self.peer_addr = addr
+                    self.send_ack((sequence + 1) & 0xffff)
+                    return True
+        except socket.timeout:
+            return False
+        finally:
+            self.sock.settimeout(old_timeout)
+
+    # ============================================================
+    # SEND RELIABLE PACKET
+    # ============================================================
+
+    def send_reliable(
+        self,
+        sequence,
+        payload=b"",
+        flags=FLAG_DATA
+    ):
+        """
+        Send one packet reliably.
+
+        Packet is retransmitted until the correct
+        ACK is received or retry limit is reached.
+        """
+
+        if self.peer_addr is None:
+            return False
+
+        packet = self.create_packet(
+            sequence=sequence,
+            ack=0,
+            flags=flags,
+            payload=payload
+        )
+
+        expected_ack = (
+            (sequence + 1)
+            & 0xffff
+        )
+
+        for attempt in range(
+            UDP_MAX_RETRIES
+        ):
+
             try:
-                self.sock.sendto(packet, self.peer_addr)
-                try:
-                    ack_data, _ = self.sock.recvfrom(64)
-                    if len(ack_data) >= 12 and ack_data[4] & 0x01:
+
+                self.sock.sendto(
+                    packet,
+                    self.peer_addr
+                )
+
+                self.sock.settimeout(
+                    UDP_TIMEOUT
+                )
+
+                while True:
+
+                    ack_data, addr = (
+                        self.sock.recvfrom(64)
+                    )
+
+                    if addr != self.peer_addr:
+                        continue
+
+                    (
+                        ack_seq,
+                        ack_number,
+                        ack_flags,
+                        ack_payload,
+                        valid
+                    ) = self.parse_packet(
+                        ack_data
+                    )
+
+                    if not valid:
+                        continue
+
+                    if not (
+                        ack_flags
+                        & self.FLAG_ACK
+                    ):
+                        continue
+
+                    if ack_number == expected_ack:
+
                         return True
-                except TimeoutError:
-                    pass
+
+            except socket.timeout:
+
+                print(
+                    f"UDP ACK timeout "
+                    f"seq={sequence}, "
+                    f"retry={attempt + 1}/"
+                    f"{UDP_MAX_RETRIES}"
+                )
+
             except Exception as e:
-                print(f"Send error: {e}")
+
+                print(
+                    f"UDP send error: {e}"
+                )
+
         return False
 
-    def send_ack(self, ack_sequence: int):
-        """Send ACK for received packet"""
-        if self.peer_addr is None:
-            return
-        ack_packet = self.create_packet(ack_sequence, 0, 0x01)
-        self.sock.sendto(ack_packet, self.peer_addr)
+    # ============================================================
+    # RECEIVE ONE RELIABLE PACKET
+    # ============================================================
 
-    def send_fin(self):
-        """Send FIN to indicate end of transfer"""
-        if self.peer_addr is None:
-            return
-        fin_packet = self.create_packet(self.sequence, 0, 0x02)
-        self.sock.sendto(fin_packet, self.peer_addr)
+    def receive_reliable(
+        self,
+        expected_sequence,
+        timeout=None
+    ):
+        """
+        Receive packets in order.
 
-    def receive_packet(self):
-        """Receive and parse packet, send ACK"""
-        try:
-            data, addr = self.sock.recvfrom(UDP_BUFFER_SIZE + 128)
-            if self.peer_addr is None:
-                self.peer_addr = addr
-            sequence, ack, flags, payload, is_valid = self.parse_packet(data)
-            if is_valid and sequence is not None:
-                self.send_ack(sequence + 1)
-                return sequence, ack, flags, payload
-            return None, None, None, None
-        except TimeoutError:
-            return None, None, None, None
-        except Exception as e:
-            print(f"Receive error: {e}")
-            return None, None, None, None
+        Duplicate packets are ACKed again.
 
-    def receive_until_fin(self):
-        """Receive packets until FIN flag is set, return sorted list"""
-        received_packets = []
+        Out-of-order packets are ignored and the
+        last expected ACK is sent again.
+        """
+
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        else:
+            self.sock.settimeout(
+                UDP_TIMEOUT
+            )
+
         while True:
-            sequence, ack, flags, payload = self.receive_packet()
-            if sequence is None:
-                break
-            received_packets.append((sequence, payload))
-            if flags is not None and flags & 0x02:  # FIN flag
-                break
-        received_packets.sort(key=lambda x: x[0])
-        return received_packets
+
+            try:
+
+                data, addr = self.sock.recvfrom(
+                    UDP_BUFFER_SIZE
+                    + self.HEADER_SIZE
+                    + 64
+                )
+
+                (
+                    sequence,
+                    ack,
+                    flags,
+                    payload,
+                    valid
+                ) = self.parse_packet(data)
+
+                if not valid:
+                    continue
+
+                if self.peer_addr is None:
+                    self.peer_addr = addr
+
+                if addr != self.peer_addr:
+                    continue
+
+                # ------------------------------------------------
+                # Ignore ACK packets
+                # ------------------------------------------------
+
+                if flags & self.FLAG_ACK:
+                    continue
+
+                # ------------------------------------------------
+                # Correct sequence
+                # ------------------------------------------------
+
+                if sequence == expected_sequence:
+
+                    self.send_ack(
+                        expected_sequence + 1
+                    )
+
+                    return (
+                        sequence,
+                        flags,
+                        payload,
+                        True
+                    )
+
+                # ------------------------------------------------
+                # Duplicate packet
+                # ------------------------------------------------
+
+                previous_sequence = (
+                    expected_sequence - 1
+                ) & 0xffff
+
+                if sequence == previous_sequence:
+
+                    self.send_ack(
+                        expected_sequence
+                    )
+
+                    continue
+
+                # ------------------------------------------------
+                # Out-of-order packet
+                # ------------------------------------------------
+
+                self.send_ack(
+                    expected_sequence
+                )
+
+            except socket.timeout:
+
+                return (
+                    None,
+                    None,
+                    b"",
+                    False
+                )
+
+            except Exception as e:
+
+                print(
+                    f"UDP receive error: {e}"
+                )
+
+                return (
+                    None,
+                    None,
+                    b"",
+                    False
+                )
+
+    # ============================================================
+    # CLOSE
+    # ============================================================
 
     def close(self):
-        """Close UDP socket"""
+
         if self.sock:
-            self.sock.close()
 
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
+            self.sock = None
 # ================================================================
 # FTP Server Session
 # ================================================================
 class FTPSession:
     """Represents a single FTP client session"""
 
-    def __init__(self, client_socket, client_address):
+    def __init__(self, client_socket, client_address, log_callback=None):
         self.client_socket = client_socket
         self.client_address = client_address
+        self.log_callback = log_callback
         self.authenticated = False
         self.username = None
         self.current_directory = os.path.abspath(DATA_DIR)
@@ -279,6 +642,12 @@ class FTPSession:
         self.last_command_time = time.time()
         self.active = True
         self.udp_server = None
+    def log(self, message, level="info"):
+        if self.log_callback:
+            try:
+                self.log_callback(message, level)
+            except Exception:
+                pass
 
     def send_response(self, code: int, message: str):
         """Send response to client over TCP"""
@@ -418,19 +787,66 @@ class FTPSession:
 
     def cmd_pwd(self):
         """Handle PWD command - Print working directory"""
-        self.send_response(257, f'"{self.current_directory}"')
 
+        if not self.authenticated:
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
+            return
+
+        self.send_response(
+            257,
+            f'"{self.current_directory}"'
+        )
     def cmd_cwd(self, path):
         """Handle CWD command - Change working directory"""
+
         if not self.authenticated:
-            self.send_response(530, FTPResponse.NOT_LOGGED_IN)
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
             return
-        new_path = os.path.normpath(os.path.join(self.current_directory, path))
+
+        new_path = os.path.abspath(
+            os.path.join(
+                self.current_directory,
+                path
+            )
+        )
+
+        try:
+            if os.path.commonpath(
+                [
+                    os.path.abspath(self.home_directory),
+                    new_path
+                ]
+            ) != os.path.abspath(self.home_directory):
+                self.send_response(
+                    550,
+                    FTPResponse.DIRECTORY_NOT_FOUND
+                )
+                return
+        except ValueError:
+            self.send_response(
+                550,
+                FTPResponse.DIRECTORY_NOT_FOUND
+            )
+            return
+
         if os.path.isdir(new_path):
             self.current_directory = new_path
-            self.send_response(257, f'"{new_path}"')
+
+            self.send_response(
+                250,
+                FTPResponse.COMMAND_OK
+            )
         else:
-            self.send_response(550, FTPResponse.DIRECTORY_NOT_FOUND)
+            self.send_response(
+                550,
+                FTPResponse.DIRECTORY_NOT_FOUND
+            )
 
     def cmd_cdup(self):
         """Handle CDUP command - Change to parent directory"""
@@ -438,27 +854,121 @@ class FTPSession:
 
     def cmd_mkd(self, dirname):
         """Handle MKD command - Make directory"""
-        if not self.authenticated:
-            self.send_response(530, FTPResponse.NOT_LOGGED_IN)
-            return
-        new_dir = os.path.join(self.current_directory, dirname)
-        try:
-            os.makedirs(new_dir, exist_ok=True)
-            self.send_response(257, f'"{new_dir}" created.')
-        except Exception:
-            self.send_response(550, FTPResponse.FILE_ACTION_FAILED)
 
+        if not self.authenticated:
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
+            return
+
+        if not dirname:
+            self.send_response(
+                501,
+                FTPResponse.PARAMETER_ERROR
+            )
+            return
+
+        new_dir = os.path.abspath(
+            os.path.join(
+                self.current_directory,
+                dirname
+            )
+        )
+
+        try:
+            if os.path.commonpath(
+                [
+                    os.path.abspath(self.home_directory),
+                    new_dir
+                ]
+            ) != os.path.abspath(self.home_directory):
+                self.send_response(
+                    550,
+                    FTPResponse.FILE_ACTION_FAILED
+                )
+                return
+
+        except ValueError:
+            self.send_response(
+                550,
+                FTPResponse.FILE_ACTION_FAILED
+            )
+            return
+
+        try:
+            os.makedirs(
+                new_dir,
+                exist_ok=True
+            )
+
+            self.send_response(
+                257,
+                f'"{new_dir}" created.'
+            )
+
+        except Exception:
+            self.send_response(
+                550,
+                FTPResponse.FILE_ACTION_FAILED
+            )
     def cmd_rmd(self, dirname):
         """Handle RMD command - Remove directory"""
+
         if not self.authenticated:
-            self.send_response(530, FTPResponse.NOT_LOGGED_IN)
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
             return
-        dir_path = os.path.join(self.current_directory, dirname)
+
+        if not dirname:
+            self.send_response(
+                501,
+                FTPResponse.PARAMETER_ERROR
+            )
+            return
+
+        dir_path = os.path.abspath(
+            os.path.join(
+                self.current_directory,
+                dirname
+            )
+        )
+
+        try:
+            if os.path.commonpath(
+                [
+                    os.path.abspath(self.home_directory),
+                    dir_path
+                ]
+            ) != os.path.abspath(self.home_directory):
+                self.send_response(
+                    550,
+                    FTPResponse.FILE_ACTION_FAILED
+                )
+                return
+
+        except ValueError:
+            self.send_response(
+                550,
+                FTPResponse.FILE_ACTION_FAILED
+            )
+            return
+
         try:
             os.rmdir(dir_path)
-            self.send_response(250, FTPResponse.COMMAND_OK)
+
+            self.send_response(
+                250,
+                FTPResponse.COMMAND_OK
+            )
+
         except Exception:
-            self.send_response(550, FTPResponse.FILE_ACTION_FAILED)
+            self.send_response(
+                550,
+                FTPResponse.FILE_ACTION_FAILED
+            )
 
     def cmd_list(self, path):
         """Handle LIST command - List directory contents"""
@@ -486,135 +996,6 @@ class FTPSession:
 
     def cmd_size(self, filename):
         """Handle SIZE command - Get file size"""
-        file_path = os.path.join(self.current_directory, filename)
-        if os.path.isfile(file_path):
-            size = os.path.getsize(file_path)
-            self.send_response(213, f"{size} bytes")
-        else:
-            self.send_response(550, FTPResponse.FILE_NOT_FOUND)
-
-    def cmd_type(self, args):
-        """Handle TYPE command - Set transfer type"""
-        if args.upper() in ["A", "I"]:
-            self.transfer_type = "ascii" if args.upper() == "A" else "binary"
-            self.send_response(200, FTPResponse.COMMAND_OK)
-        else:
-            self.send_response(501, FTPResponse.PARAMETER_ERROR)
-
-    def cmd_pasv(self):
-        """Handle PASV command - Enter passive mode"""
-
-        if not self.authenticated:
-            self.send_response(
-                530,
-                FTPResponse.NOT_LOGGED_IN
-            )
-            return
-
-        if self.udp_server is not None:
-            try:
-                self.udp_server.close()
-            except Exception:
-                pass
-
-            self.udp_server = None
-            self.data_port = None
-
-        self.udp_server = ReliableUDP(
-            HOST,
-            0
-        )
-
-        self.data_port = (
-            self.udp_server.local_port
-        )
-
-        ip = HOST
-
-        if ip == "0.0.0.0":
-            try:
-                with socket.socket(
-                    socket.AF_INET,
-                    socket.SOCK_DGRAM
-                ) as s:
-
-                    s.connect(
-                        (
-                            self.client_address[0],
-                            9
-                        )
-                    )
-
-                    ip = s.getsockname()[0]
-
-            except Exception:
-                ip = socket.gethostbyname(
-                    socket.gethostname()
-                )
-
-        parts = ip.split(".")
-
-        self.send_response(
-            227,
-            (
-                "Entering Passive Mode "
-                f"({','.join(parts)},"
-                f"{self.data_port // 256},"
-                f"{self.data_port % 256})"
-            )
-        )
-
-        print(
-            f"PASV for {self.client_address}: "
-            f"{ip}:{self.data_port}"
-        )
-
-    def cmd_retr(self, filename):
-        """Handle RETR command - Retrieve (download) file"""
-        if not self.authenticated:
-            self.send_response(530, FTPResponse.NOT_LOGGED_IN)
-            return
-        file_path = os.path.join(self.current_directory, filename)
-        if not os.path.isfile(file_path):
-            self.send_response(550, FTPResponse.FILE_NOT_FOUND)
-            return
-        try:
-            # Open file for reading
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
-
-            # Send file over UDP data channel
-            self.send_response(150, FTPResponse.FILE_ACTION_PENDING)
-
-            if not self.udp_server:
-                self.send_response(425, "No data connection established")
-                return
-
-            chunk_size = UDP_BUFFER_SIZE - 12  # Subtract header size
-            chunks = [file_data[i:i + chunk_size] for i in range(0, len(file_data), chunk_size)]
-
-            # Send each chunk with sequence number
-            for i, chunk in enumerate(chunks):
-                is_last = i == len(chunks) - 1
-                flags = 0x04  # SYN flag
-                if is_last:
-                    flags |= 0x02  # FIN flag
-                if self.udp_server.peer_addr:
-                    packet = self.udp_server.create_packet(i, 0, flags, chunk)
-                    self.udp_server.sock.sendto(packet, self.udp_server.peer_addr)
-                    # Wait for ACK
-                    try:
-                        _, _ = self.udp_server.sock.recvfrom(64)
-                    except TimeoutError:
-                        # Retry
-                        pass
-
-            self.send_response(226, FTPResponse.TRANSFER_COMPLETE)
-        except Exception:
-            self.send_response(451, "Data transfer error")
-
-    def cmd_stor(self, filename):
-        """Handle STOR command - Store (upload) file"""
 
         if not self.authenticated:
             self.send_response(
@@ -630,37 +1011,25 @@ class FTPSession:
             )
             return
 
-        if self.udp_server is None:
-            self.send_response(
-                425,
-                "Use PASV first."
+        file_path = os.path.abspath(
+            os.path.join(
+                self.current_directory,
+                filename
             )
-            return
-
-        file_path = os.path.join(
-            self.current_directory,
-            filename
         )
 
-        # Security: prevent ../ escaping current user directory
         try:
-            real_file_path = os.path.abspath(file_path)
-            real_current_dir = os.path.abspath(
-                self.current_directory
-            )
-            real_home_dir = os.path.abspath(
-                self.home_directory
-            )
-
             if os.path.commonpath(
-                [real_home_dir, real_file_path]
-            ) != real_home_dir:
+                [
+                    os.path.abspath(self.home_directory),
+                    file_path
+                ]
+            ) != os.path.abspath(self.home_directory):
                 self.send_response(
                     550,
                     FTPResponse.FILE_ACTION_FAILED
                 )
                 return
-
         except ValueError:
             self.send_response(
                 550,
@@ -668,67 +1037,328 @@ class FTPSession:
             )
             return
 
+        if os.path.isfile(file_path):
+            size = os.path.getsize(file_path)
+
+            self.send_response(
+                213,
+                f"{size}"
+            )
+        else:
+            self.send_response(
+                550,
+                FTPResponse.FILE_NOT_FOUND
+            )
+
+    def cmd_type(self, args):
+        """Handle TYPE command - Set transfer type"""
+        if args.upper() in ["A", "I"]:
+            self.transfer_type = "ascii" if args.upper() == "A" else "binary"
+            self.send_response(200, FTPResponse.COMMAND_OK)
+        else:
+            self.send_response(501, FTPResponse.PARAMETER_ERROR)
+
+    def cmd_pasv(self):
+        """Handle PASV command - Create UDP data channel."""
+
+        if not self.authenticated:
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
+            return
+
+        # Close previous UDP socket
+        if self.udp_server is not None:
+
+            try:
+                self.udp_server.close()
+            except Exception:
+                pass
+
+            self.udp_server = None
+            self.data_port = None
+
+        # Create UDP socket
+        self.udp_server = ReliableUDP(
+            HOST,
+            0
+        )
+
+        self.data_port = (
+            self.udp_server.local_port
+        )
+
+        # Determine server IP
+        ip = HOST
+
+        if ip == "0.0.0.0":
+
+            try:
+
+                with socket.socket(
+                    socket.AF_INET,
+                    socket.SOCK_DGRAM
+                ) as s:
+
+                    s.connect(
+                        (
+                            self.client_address[0],
+                            9
+                        )
+                    )
+
+                    ip = s.getsockname()[0]
+
+            except Exception:
+
+                ip = socket.gethostbyname(
+                    socket.gethostname()
+                )
+
+        parts = ip.split(".")
+
+        response = (
+            "Entering Passive Mode "
+            f"({','.join(parts)},"
+            f"{self.data_port // 256},"
+            f"{self.data_port % 256})"
+        )
+
+        self.send_response(
+            227,
+            response
+        )
+
+        self.log(
+            f"UDP data channel created: "
+            f"{ip}:{self.data_port}"
+        )
+
+    def cmd_retr(self, filename):
+        """Handle RETR - Reliable UDP file download."""
+
+        if not self.authenticated:
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
+            return
+
+        if not filename:
+            self.send_response(
+                501,
+                FTPResponse.PARAMETER_ERROR
+            )
+            return
+
+        file_path = os.path.abspath(
+            os.path.join(
+                self.current_directory,
+                filename
+            )
+        )
+
+        # --------------------------------------------------------
+        # Security check
+        # --------------------------------------------------------
+
         try:
-            print(
-                f"Starting upload from "
-                f"{self.client_address}: "
-                f"{filename}"
+
+            if os.path.commonpath(
+                [
+                    os.path.abspath(
+                        self.home_directory
+                    ),
+                    file_path
+                ]
+            ) != os.path.abspath(
+                self.home_directory
+            ):
+
+                self.send_response(
+                    550,
+                    FTPResponse.FILE_ACTION_FAILED
+                )
+                return
+
+        except ValueError:
+
+            self.send_response(
+                550,
+                FTPResponse.FILE_ACTION_FAILED
+            )
+            return
+
+        if not os.path.isfile(file_path):
+
+            self.send_response(
+                550,
+                FTPResponse.FILE_NOT_FOUND
+            )
+            return
+
+        if self.udp_server is None:
+
+            self.send_response(
+                425,
+                "Use PASV first."
+            )
+            return
+
+        try:
+
+            # ----------------------------------------------------
+            # Read file
+            # ----------------------------------------------------
+
+            with open(
+                file_path,
+                "rb"
+            ) as f:
+
+                file_data = f.read()
+
+            total_size = len(file_data)
+
+            self.log(
+                f"Starting download: "
+                f"{filename} | "
+                f"{total_size} bytes"
             )
 
-            print(
-                f"Using UDP data port: "
-                f"{self.udp_server.local_port}"
-            )
+            # ----------------------------------------------------
+            # Tell FTP client transfer is starting
+            # ----------------------------------------------------
 
-        
             self.send_response(
                 150,
                 FTPResponse.FILE_ACTION_PENDING
             )
-            packets = self.udp_server.receive_until_fin()
 
-            if not packets:
-                raise RuntimeError(
-                    "No UDP packets received."
-                )
-            total_bytes = 0
+            # ----------------------------------------------------
+            # Wait for UDP HELLO
+            # ----------------------------------------------------
 
-            with open(
-                real_file_path,
-                "wb"
-            ) as f:
-
-                for sequence, payload in packets:
-
-                    # FIN packet normally has empty payload.
-                    if payload:
-                        f.write(payload)
-                        total_bytes += len(payload)
-
-            print(
-                f"Upload complete: "
-                f"{filename} | "
-                f"{total_bytes} bytes | "
-                f"{len(packets)} packets | "
-                f"{real_file_path}"
+            self.log(
+                "Waiting for UDP HELLO..."
             )
+
+            if not self.udp_server.wait_for_hello(
+                timeout=10
+            ):
+                self.log(
+                    "UDP client did not connect",
+                    "error"
+                )
+
+                self.send_response(
+                    425,
+                    "UDP data connection timeout."
+                )
+
+                return
+
+            self.log(
+                f"UDP peer connected: "
+                f"{self.udp_server.peer_addr}"
+            )
+
+            # ----------------------------------------------------
+            # Split file into packets
+            # ----------------------------------------------------
+
+            chunk_size = UDP_BUFFER_SIZE
+
+            chunks = [
+                file_data[i:i + chunk_size]
+                for i in range(
+                    0,
+                    len(file_data),
+                    chunk_size
+                )
+            ]
+
+            # Empty file
+            if not chunks:
+                chunks = [b""]
+
+            total_packets = len(chunks)
+
+            # ----------------------------------------------------
+            # Send packets reliably
+            # ----------------------------------------------------
+
+            for sequence, chunk in enumerate(
+                chunks
+            ):
+
+                is_last = (
+                    sequence
+                    == total_packets - 1
+                )
+
+                flags = (
+                    ReliableUDP.FLAG_DATA
+                )
+
+                if is_last:
+                    flags |= (
+                        ReliableUDP.FLAG_FIN
+                    )
+
+                success = (
+                    self.udp_server.send_reliable(
+                        sequence=sequence,
+                        payload=chunk,
+                        flags=flags
+                    )
+                )
+
+                if not success:
+
+                    raise RuntimeError(
+                        f"Failed to send UDP "
+                        f"packet {sequence}"
+                    )
+
+                self.log(
+                    f"UDP packet sent: "
+                    f"{sequence + 1}/"
+                    f"{total_packets}"
+                )
+
+            # ----------------------------------------------------
+            # Transfer complete
+            # ----------------------------------------------------
+
             self.send_response(
                 226,
                 FTPResponse.TRANSFER_COMPLETE
             )
 
+            self.log(
+                f"Download complete: "
+                f"{filename} | "
+                f"{total_size} bytes | "
+                f"{total_packets} packets"
+            )
+
         except Exception as e:
 
-            print(
-                f"Upload error for "
-                f"{filename}: {e}"
+            self.log(
+                f"Download error for "
+                f"{filename}: {e}",
+                "error"
             )
 
             try:
+
                 self.send_response(
                     451,
                     "Data transfer error"
                 )
+
             except Exception:
                 pass
 
@@ -742,7 +1372,203 @@ class FTPSession:
                     pass
 
                 self.udp_server = None
+                self.data_port = None
 
+    def cmd_stor(self, filename):
+        """Handle STOR - Reliable UDP file upload."""
+
+        if not self.authenticated:
+
+            self.send_response(
+                530,
+                FTPResponse.NOT_LOGGED_IN
+            )
+
+            return
+
+        if not filename:
+
+            self.send_response(
+                501,
+                FTPResponse.PARAMETER_ERROR
+            )
+
+            return
+
+        if self.udp_server is None:
+
+            self.send_response(
+                425,
+                "Use PASV first."
+            )
+
+            return
+
+        # --------------------------------------------------------
+        # Build destination path
+        # --------------------------------------------------------
+
+        file_path = os.path.abspath(
+            os.path.join(
+                self.current_directory,
+                filename
+            )
+        )
+
+        # --------------------------------------------------------
+        # Security check
+        # --------------------------------------------------------
+
+        try:
+
+            real_home_dir = os.path.abspath(
+                self.home_directory
+            )
+
+            if os.path.commonpath(
+                [
+                    real_home_dir,
+                    file_path
+                ]
+            ) != real_home_dir:
+
+                self.send_response(
+                    550,
+                    FTPResponse.FILE_ACTION_FAILED
+                )
+
+                return
+
+        except ValueError:
+
+            self.send_response(
+                550,
+                FTPResponse.FILE_ACTION_FAILED
+            )
+
+            return
+
+        try:
+
+            self.log(
+                f"Starting upload: "
+                f"{filename}"
+            )
+
+            # ----------------------------------------------------
+            # Tell client to start transfer
+            # ----------------------------------------------------
+
+            self.send_response(
+                150,
+                FTPResponse.FILE_ACTION_PENDING
+            )
+
+            # ----------------------------------------------------
+            # UDP HELLO
+            # ----------------------------------------------------
+            self.log("Waiting for UDP HELLO...")
+
+            if not self.udp_server.wait_for_hello(timeout=10):
+                raise RuntimeError(
+                    "UDP client connection timeout."
+                )
+
+            self.log(
+                f"UDP peer connected: "
+                f"{self.udp_server.peer_addr}"
+            )
+
+            # ----------------------------------------------------
+            # Receive file reliably
+            # ----------------------------------------------------
+            total_bytes = 0
+            total_packets = 0
+            expected_sequence = 0
+
+            with open(file_path, "wb") as f:
+                while True:
+                    result = self.udp_server.receive_reliable(
+                        expected_sequence,
+                        timeout=UDP_TIMEOUT
+                    )
+
+                    if result is None:
+                        raise RuntimeError(
+                            "UDP receive timeout."
+                        )
+
+                    sequence, flags, payload, success = result
+
+                    if not success:
+                        raise RuntimeError(
+                            "Invalid UDP packet."
+                        )
+
+                    if payload:
+                        f.write(payload)
+                        total_bytes += len(payload)
+
+                    total_packets += 1
+
+                    self.log(
+                        f"UDP packet received: {total_packets} | "
+                        f"seq={sequence} | {len(payload)} bytes"
+                    )
+
+                    expected_sequence = (
+                        expected_sequence + 1
+                    ) & 0xffff
+
+                    if flags & ReliableUDP.FLAG_FIN:
+                        self.log("FIN received.")
+                        break
+
+            # ----------------------------------------------------
+            # Transfer complete
+            # ----------------------------------------------------
+
+            self.send_response(
+                226,
+                FTPResponse.TRANSFER_COMPLETE
+            )
+
+            self.log(
+                f"Upload complete: "
+                f"{filename} | "
+                f"{total_bytes} bytes | "
+                f"{total_packets} packets | "
+                f"{file_path}"
+            )
+
+        except Exception as e:
+
+            self.log(
+                f"Upload error for "
+                f"{filename}: {e}",
+                "error"
+            )
+
+            try:
+
+                self.send_response(
+                    451,
+                    "Data transfer error"
+                )
+
+            except Exception:
+                pass
+
+        finally:
+
+            if self.udp_server is not None:
+
+                try:
+                    self.udp_server.close()
+                except Exception:
+                    pass
+
+                self.udp_server = None
                 self.data_port = None
 
     def cmd_help(self, args):
@@ -781,13 +1607,21 @@ class FTPSession:
 class FTPServer:
     """Main FTP Server class that handles multiple client connections"""
 
-    def __init__(self, host, port):
+    def __init__(self, host, port, log_callback=None):
         self.host = host
         self.port = port
         self.server_socket = None
         self.sessions = []
         self.sessions_lock = threading.Lock()
         self.running = False
+        self.log_callback = log_callback
+    def log(self, message, level="info"):
+        """Send operational log to GUI if callback is available."""
+        if self.log_callback:
+            try:
+                self.log_callback(message, level)
+            except Exception:
+                pass
 
     def start(self):
         """Initialize and start the FTP server"""
@@ -802,18 +1636,17 @@ class FTPServer:
             os.makedirs(DATA_DIR)
 
         self.running = True
-        print(f"FTP Server started on {self.host}:{self.port}")
-        print(f"Data directory: {DATA_DIR}")
-        print(f"Press Ctrl+C to stop\n")
+        self.log(f"FTP Server started on {self.host}:{self.port}")
+        self.log(f"Data directory: {DATA_DIR}")
 
         # Accept client connections
         try:
             while self.running:
                 client_socket, client_address = self.server_socket.accept()
-                print(f"New connection from {client_address}")
+                self.log(f"New connection from {client_address}")
 
                 # Create session and handle in new thread
-                session = FTPSession(client_socket, client_address)
+                session = FTPSession(client_socket, client_address, self.log_callback)
                 with self.sessions_lock:
                     self.sessions.append(session)
 
@@ -837,7 +1670,7 @@ class FTPServer:
             while session.active:
                 # Check for session timeout
                 if time.time() - session.last_command_time > SESSION_TIMEOUT:
-                    print(f"Session timeout for {session.client_address}")
+                    self.log(f"Session timeout for {session.client_address}", "warning")
                     session.send_response(421, "Session timed out")
                     session.active = False
                     break
@@ -845,10 +1678,13 @@ class FTPServer:
                 command = session.receive_command()
                 if not command:
                     break
-                print(f"Received command from {session.client_address}: {command}")
+                self.log(
+                    f"Received command from "
+                    f"{session.client_address}: {command}"
+                )
                 session.execute_command(command)
         except Exception as e:
-            print(f"Error handling client: {e}")
+            self.log(f"Error handling client: {e}", "error")
         finally:
             # Close connections
             try:
@@ -863,14 +1699,17 @@ class FTPServer:
                 if session in self.sessions:
                     self.sessions.remove(session)
 
-            print(f"Client {session.client_address} disconnected")
+            self.log(f"Client {session.client_address} disconnected")
 
     def stop(self):
         """Stop the server gracefully"""
         self.running = False
         if self.server_socket:
-            self.server_socket.close()
-        print("Server stopped")
+            try:
+                self.server_socket.close()
+            except Exception as e:
+                self.log(f"Error closing server socket: {e}", "error")
+        self.log("Server stopped")
 
     def get_connected_clients(self):
         """Get list of connected clients for GUI"""
@@ -880,27 +1719,21 @@ class FTPServer:
 
 
 if __name__ == "__main__":
-    server = FTPServer(HOST, TCP_PORT)
-    try:
-        server.start()
-    except Exception as e:
-        print(f"Server error: {e}")
-    finally:
-        server.stop()
-
-
-# ================================================================
-# Main Entry Point
-# ================================================================
-if __name__ == "__main__":
     print("=" * 50)
     print("Hybrid FTP Server - Low-level Implementation")
     print("Control: TCP | Data: UDP (with custom reliable layer)")
     print("=" * 50)
 
-    server = FTPServer(HOST, TCP_PORT)
+    server = FTPServer(
+        HOST,
+        TCP_PORT
+    )
+
     try:
         server.start()
+
     except Exception as e:
-        print(f"Server error: {e}")
+        print(
+            f"Server error: {e}"
+        )
         sys.exit(1)

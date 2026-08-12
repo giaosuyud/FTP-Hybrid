@@ -29,6 +29,7 @@ class FTPServerGUI:
         self.session_timeout = SESSION_TIMEOUT
         self.data_dir = DATA_DIR
         self.refresh_interval = 1000  # Refresh clients every 1 second
+        self.log_lock = threading.Lock()
 
     def create_window(self):
         """Create main window and all UI components"""
@@ -214,12 +215,24 @@ class FTPServerGUI:
 
         # Update time
         self.update_time()
-
     def add_log(self, message, level="info"):
         """Add log entry to the log panel"""
+
+        if not hasattr(self, "root"):
+            return
+
+        self.root.after(
+            0,
+            lambda: self._add_log(message, level)
+        )
+
+    def _add_log(self, message, level="info"):
+        """Update log widget safely from Tkinter thread"""
+
         self.log_text.config(state=tk.NORMAL)
+
         timestamp = datetime.now().strftime("[%H:%M:%S.%f]")
-        
+
         if level == "info":
             color = "black"
         elif level == "warning":
@@ -229,12 +242,21 @@ class FTPServerGUI:
         else:
             color = "black"
 
-        self.log_text.insert(tk.END, f"{timestamp} [{level.upper()}] - {message}\n")
-        self.log_text.tag_add("tag", "end-1l")
-        self.log_text.tag_configure("tag", foreground=color)
+        tag_name = f"log_{level}"
+
+        self.log_text.tag_configure(
+            tag_name,
+            foreground=color
+        )
+
+        self.log_text.insert(
+            tk.END,
+            f"{timestamp} [{level.upper()}] - {message}\n",
+            tag_name
+        )
+
         self.log_text.config(state=tk.DISABLED)
         self.log_text.see(tk.END)
-
     def clear_log(self):
         """Clear log panel"""
         self.log_text.config(state=tk.NORMAL)
@@ -254,7 +276,11 @@ class FTPServerGUI:
             self.session_timeout = int(self.timeout_var.get())
             self.data_dir = self.data_dir_var.get()
 
-            self.server = FTPServer(self.host, self.port)
+            self.server = FTPServer(
+                self.host,
+                self.port,
+                log_callback=self.add_log
+            )
             self.add_log(f"Starting server on {self.host}:{self.port}")
 
             # Start server in background thread
@@ -279,7 +305,12 @@ class FTPServerGUI:
         try:
             self.server.start()
         except Exception as e:
-            self.root.after(0, lambda: self.add_log(f"Server error: {str(e)}", "error"))
+            self.root.after(
+                0,
+                self.add_log,
+                f"Server error: {e}",
+                "error"
+            )
         finally:
             self.root.after(0, self.stop_server)
 

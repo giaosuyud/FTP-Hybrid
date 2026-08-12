@@ -31,6 +31,7 @@ class FTPClientGUI:
         self.is_transferring = False
         self.transfer_mode = "binary"  # binary or ascii
         self.remote_files_list = []  # Store remote file info
+        self.remote_virtual_path = "/"
         self.local_selected_file = None  # Store locally selected file
         self.transfer_size = 0
         self.transfer_transferred = 0
@@ -469,8 +470,16 @@ class FTPClientGUI:
         """Handle successful login"""
         self.set_status("Logged in", "green")
         self.add_log("Login successful")
-        self.add_log(f"Current directory: {self.client.current_directory}")
-        self.remote_dir_label.config(text=self.client.current_directory, foreground="green")
+
+        # FTP path bắt đầu từ /
+        self.remote_virtual_path = "/"
+        self.remote_path_var.set("/")
+
+        # Ẩn đường dẫn vật lý server
+        self.remote_dir_label.config(
+            text=""
+        )
+
         self.refresh_remote()
 
     def login_failed(self, error):
@@ -484,37 +493,158 @@ class FTPClientGUI:
         if not self.authenticated:
             messagebox.showwarning("Warning", "Not logged in!")
             return
-        try:
-            self.client.cdup()
-            self.refresh_remote()
-        except Exception as e:
-            self.add_log(f"Error: {str(e)}", "red")
 
+        try:
+            response = self.client._send_command("CDUP")
+
+            if response.startswith("250"):
+
+                # Tính thư mục cha dựa trên FTP path
+                if self.remote_virtual_path != "/":
+
+                    current = self.remote_virtual_path.rstrip("/")
+
+                    if "/" in current:
+                        parent = current.rsplit("/", 1)[0]
+
+                        if not parent:
+                            parent = "/"
+
+                        self.remote_virtual_path = parent
+                    else:
+                        self.remote_virtual_path = "/"
+
+                # Cập nhật ô Path
+                self.remote_path_var.set(
+                    self.remote_virtual_path
+                )
+
+                self.remote_dir_label.config(
+                    text=""
+                )
+
+                self.refresh_remote()
+
+                self.add_log(
+                    f"Remote directory: {self.remote_virtual_path}"
+                )
+
+            else:
+                self.add_log(
+                    f"CDUP failed: {response}",
+                    "red"
+                )
+
+        except Exception as e:
+            self.add_log(
+                f"Error changing directory: {str(e)}",
+                "red"
+            )
     def remote_cwd(self, path=None):
         """Change working directory on remote server"""
         if not self.authenticated:
             messagebox.showwarning("Warning", "Not logged in!")
             return
-        if not path:
-            path = self.remote_path_var.get()
-        try:
-            self.client.cwd(path)
-            self.refresh_remote()
-        except Exception as e:
-            self.add_log(f"Error: {str(e)}", "red")
 
+        if path is None:
+            path = self.remote_path_var.get().strip()
+
+        if not path:
+            return
+
+        try:
+            response = self.client._send_command(f"CWD {path}")
+
+            if response.startswith("250"):
+                # Nếu nhập đường dẫn tuyệt đối
+                if path.startswith("/"):
+                    self.remote_virtual_path = path.rstrip("/") or "/"
+
+                # Nếu nhập tên thư mục tương đối
+                else:
+                    if self.remote_virtual_path == "/":
+                        self.remote_virtual_path = "/" + path.strip("/")
+                    else:
+                        self.remote_virtual_path = (
+                            self.remote_virtual_path.rstrip("/")
+                            + "/"
+                            + path.strip("/")
+                        )
+
+                # Ô Path CHỈ hiển thị đường dẫn FTP ảo
+                self.remote_path_var.set(
+                    self.remote_virtual_path
+                )
+
+                # Không hiện đường dẫn vật lý server
+                self.remote_dir_label.config(
+                    text=""
+                )
+
+                self.refresh_remote()
+
+                self.add_log(
+                    f"Remote directory: {self.remote_virtual_path}"
+                )
+
+            else:
+                messagebox.showerror(
+                    "Error",
+                    f"Cannot enter directory:\n{path}\n\n{response}"
+                )
+
+        except Exception as e:
+            self.add_log(
+                f"Error changing remote directory: {str(e)}",
+                "red"
+            )
     def remote_mkdir(self):
         """Create directory on remote server"""
         if not self.authenticated:
             messagebox.showwarning("Warning", "Not logged in!")
             return
-        dirname = simpledialog.askstring("New Folder", "Enter folder name:")
-        if dirname:
-            try:
-                self.client.mkdir(dirname)
+
+        dirname = simpledialog.askstring(
+            "New Folder",
+            "Enter folder name:"
+        )
+
+        if not dirname:
+            return
+
+        dirname = dirname.strip()
+
+        if not dirname:
+            return
+
+        try:
+            success = self.client.mkdir(dirname)
+
+            if success:
+                self.add_log(
+                    f"Remote folder created: {dirname}",
+                    "green"
+                )
+
+                # Refresh danh sách để thấy folder vừa tạo
                 self.refresh_remote()
-            except Exception as e:
-                self.add_log(f"Error: {str(e)}", "red")
+
+            else:
+                self.add_log(
+                    f"Failed to create remote folder: {dirname}",
+                    "red"
+                )
+
+                messagebox.showerror(
+                    "Error",
+                    f"Cannot create folder:\n{dirname}"
+                )
+
+        except Exception as e:
+            self.add_log(
+                f"Error creating remote folder: {str(e)}",
+                "red"
+            )
 
     def refresh_remote(self):
         """Refresh remote file list"""
@@ -862,9 +992,5 @@ if __name__ == "__main__":
     gui = FTPClientGUI()
     gui.run()
 
-
-if __name__ == "__main__":
-    app = FTPClientGUI()
-    app.run()
 
 

@@ -1,6 +1,7 @@
 import socket
 import os
 import sys
+import time
 from typing import Optional
 
 
@@ -22,72 +23,209 @@ UDP_TIMEOUT = 2.0
 # ================================================================
 class ReliableUDPClient:
     """
-    Custom reliable UDP protocol for client
-    - Sequence numbers for ordering
-    - ACK mechanism
-    - Timeout and retransmission
-    - Checksum for data integrity
+    Reliable UDP:
+    - Sequence number
+    - ACK number
+    - Checksum
+    - Retransmission
+    - Duplicate detection
+    - FIN
     """
 
+    HEADER_SIZE = 12
+
+    FLAG_ACK = 0x01
+    FLAG_FIN = 0x02
+    FLAG_DATA = 0x04
+    FLAG_HELLO = 0x08
+
     def __init__(self):
-        # Create UDP socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", 0))
         self.sock.settimeout(UDP_TIMEOUT)
+
         self.local_port = self.sock.getsockname()[1]
-        self.server_addr: Optional[tuple[str, int]] = None
-        self.sequence = 0
+        self.server_addr = None
+
+        self.expected_sequence = 0
+
+    # ------------------------------------------------------------
+    # CHECKSUM
+    # ------------------------------------------------------------
 
     def calculate_checksum(self, data: bytes) -> int:
-        """Calculate checksum for data integrity"""
         checksum = 0
+
         for i in range(0, len(data), 2):
             if i + 1 < len(data):
-                checksum += (data[i] << 8) + data[i + 1]
+                checksum += (data[i] << 8) | data[i + 1]
             else:
                 checksum += data[i] << 8
-        while checksum > 0xffff:
-            checksum = (checksum >> 16) + (checksum & 0xffff)
-        return checksum & 0xffff
 
-    def create_packet(self, sequence: int, ack: int, flags: int, payload: bytes = b""):
-        """Create reliable UDP packet with 12-byte header"""
+        while checksum > 0xFFFF:
+            checksum = (checksum >> 16) + (checksum & 0xFFFF)
+
+        return checksum & 0xFFFF
+
+    # ------------------------------------------------------------
+    # PACKET
+    # ------------------------------------------------------------
+
+    def create_packet(
+        self,
+        sequence: int,
+        ack: int,
+        flags: int,
+        payload: bytes = b""
+    ):
         checksum = self.calculate_checksum(payload)
+
         header = (
-            sequence.to_bytes(2, 'big') +
-            ack.to_bytes(2, 'big') +
+            sequence.to_bytes(2, "big") +
+            ack.to_bytes(2, "big") +
             bytes([flags]) +
-            len(payload).to_bytes(2, 'big') +
-            checksum.to_bytes(2, 'big') +
-            b'\x00' * 3
+            len(payload).to_bytes(2, "big") +
+            checksum.to_bytes(2, "big") +
+            b"\x00" * 3
         )
+
         return header + payload
 
     def parse_packet(self, data: bytes):
-        """Parse packet, return (seq, ack, flags, payload, is_valid)"""
-        if len(data) < 12:
-            return None, None, None, None, False
+
+        if len(data) < self.HEADER_SIZE:
+            return None
+
         try:
-            sequence = int.from_bytes(data[0:2], 'big')
-            ack = int.from_bytes(data[2:4], 'big')
+            sequence = int.from_bytes(data[0:2], "big")
+            ack = int.from_bytes(data[2:4], "big")
             flags = data[4]
-            payload_length = int.from_bytes(data[5:7], 'big')
-            received_checksum = int.from_bytes(data[7:9], 'big')
-            payload = data[12:12 + payload_length] if payload_length > 0 else b""
+
+            payload_length = int.from_bytes(
+                data[5:7],
+                "big"
+            )
+
+            received_checksum = int.from_bytes(
+                data[7:9],
+                "big"
+            )
+
+            if len(data) < self.HEADER_SIZE + payload_length:
+                return None
+
+            payload = data[
+                self.HEADER_SIZE:
+                self.HEADER_SIZE + payload_length
+            ]
+
             calculated_checksum = self.calculate_checksum(payload)
-            is_valid = (received_checksum == calculated_checksum)
-            return sequence, ack, flags, payload, is_valid
+
+            if received_checksum != calculated_checksum:
+                print("UDP checksum error")
+                return None
+
+            return (
+                sequence,
+                ack,
+                flags,
+                payload
+            )
+
         except Exception:
-            return None, None, None, None, False
+            return None
+
+    # ------------------------------------------------------------
+    # CONNECT
+    # ------------------------------------------------------------
 
     def connect_to_server(self, host, port):
-        """Connect to server's UDP port"""
-        self.server_addr = (host, port)
-        print(f"Connected to server UDP at {self.server_addr}")
 
-    def send_packet(self, sequence: int, payload: bytes = b"", flags: int = 0x04):
-        """Send packet with retransmission"""
-        if self.server_addr is None:
+        self.server_addr = (
+            host,
+            port
+        )
+
+        print(
+            f"UDP connected to "
+            f"{self.server_addr}"
+        )
+
+    # ------------------------------------------------------------
+    # UDP HELLO HANDSHAKE
+    # ------------------------------------------------------------
+    def hello(self):
+        """Establish UDP peer connection with the server."""
+        if not self.server_addr:
+            return False
+
+        packet = self.create_packet(0, 0, self.FLAG_HELLO)
+
+        for attempt in range(UDP_MAX_RETRIES):
+            try:
+                self.sock.sendto(packet, self.server_addr)
+
+                while True:
+                    ack_data, addr = self.sock.recvfrom(
+                        self.HEADER_SIZE + 64
+                    )
+
+                    if addr != self.server_addr:
+                        continue
+
+                    parsed = self.parse_packet(ack_data)
+                    if parsed is None:
+                        continue
+
+                    recv_seq, ack, flags, payload = parsed
+
+                    if flags & self.FLAG_ACK and ack == 1:
+                        print("UDP handshake successful")
+                        return True
+
+            except socket.timeout:
+                print(
+                    f"UDP HELLO timeout "
+                    f"({attempt + 1}/{UDP_MAX_RETRIES})"
+                )
+            except Exception as e:
+                print(f"UDP HELLO error: {e}")
+                return False
+
+        return False
+
+    # ------------------------------------------------------------
+    # ACK
+    # ------------------------------------------------------------
+
+    def send_ack(self, ack_sequence):
+
+        if not self.server_addr:
+            return
+
+        packet = self.create_packet(
+            0,
+            ack_sequence,
+            self.FLAG_ACK
+        )
+
+        self.sock.sendto(
+            packet,
+            self.server_addr
+        )
+
+    # ------------------------------------------------------------
+    # SEND ONE RELIABLE PACKET
+    # ------------------------------------------------------------
+
+    def send_packet(
+        self,
+        sequence,
+        payload=b"",
+        flags=FLAG_DATA
+    ):
+
+        if not self.server_addr:
             return False
 
         packet = self.create_packet(
@@ -97,69 +235,293 @@ class ReliableUDPClient:
             payload
         )
 
-        for _ in range(UDP_MAX_RETRIES):
+        expected_ack = sequence + 1
+
+        for attempt in range(UDP_MAX_RETRIES):
+
             try:
+
                 self.sock.sendto(
                     packet,
                     self.server_addr
                 )
 
-                try:
-                    ack_data, _ = self.sock.recvfrom(64)
+                print(
+                    f"UDP SEND seq={sequence} "
+                    f"attempt={attempt + 1}"
+                )
 
-                    if (
-                        len(ack_data) >= 12
-                        and ack_data[4] & 0x01
-                    ):
-                        return True
+                while True:
 
-                except TimeoutError:
-                    pass
+                    ack_data, addr = self.sock.recvfrom(
+                        UDP_BUFFER_SIZE + 128
+                    )
+
+                    if addr != self.server_addr:
+                        continue
+
+                    parsed = self.parse_packet(
+                        ack_data
+                    )
+
+                    if parsed is None:
+                        continue
+
+                    recv_seq, ack, recv_flags, payload = parsed
+
+                    if recv_flags & self.FLAG_ACK:
+
+                        if ack == expected_ack:
+
+                            print(
+                                f"UDP ACK seq={sequence}"
+                            )
+
+                            return True
+
+                        # ACK cũ -> bỏ qua
+
+            except socket.timeout:
+                print(
+                    f"UDP timeout seq={sequence}"
+                )
 
             except Exception as e:
-                print(f"Send error: {e}")
+                print(
+                    f"UDP send error: {e}"
+                )
+
+        print(
+            f"UDP FAILED seq={sequence}"
+        )
 
         return False
-    def send_ack(self, ack_sequence: int):
-        """Send ACK for received packet"""
-        if self.server_addr is None:
-            return
-        ack_packet = self.create_packet(ack_sequence, 0, 0x01)
-        self.sock.sendto(ack_packet, self.server_addr)
+
+    # ------------------------------------------------------------
+    # RECEIVE ONE PACKET
+    # ------------------------------------------------------------
 
     def receive_packet(self):
-        """Receive and parse packet, send ACK"""
+
         try:
-            data, _ = self.sock.recvfrom(UDP_BUFFER_SIZE + 128)
-            sequence, ack, flags, payload, is_valid = self.parse_packet(data)
-            if is_valid and sequence is not None:
-                self.send_ack(sequence + 1)
-                return sequence, ack, flags, payload
-            return None, None, None, None
-        except TimeoutError:
-            return None, None, None, None
+
+            data, addr = self.sock.recvfrom(
+                UDP_BUFFER_SIZE + 128
+            )
+
+            if self.server_addr and addr != self.server_addr:
+                return None
+
+            parsed = self.parse_packet(data)
+
+            if parsed is None:
+                return None
+
+            sequence, ack, flags, payload = parsed
+
+            # ACK packet
+            if flags & self.FLAG_ACK:
+                return (
+                    sequence,
+                    ack,
+                    flags,
+                    payload
+                )
+
+            # ----------------------------------------------------
+            # EXPECTED PACKET
+            # ----------------------------------------------------
+
+            if sequence == self.expected_sequence:
+
+                self.send_ack(
+                    sequence + 1
+                )
+
+                self.expected_sequence += 1
+
+                return (
+                    sequence,
+                    ack,
+                    flags,
+                    payload
+                )
+
+            # ----------------------------------------------------
+            # DUPLICATE PACKET
+            # ----------------------------------------------------
+
+            elif sequence < self.expected_sequence:
+
+                # Gửi lại ACK
+                self.send_ack(
+                    self.expected_sequence
+                )
+
+                print(
+                    f"Duplicate UDP packet "
+                    f"seq={sequence}"
+                )
+
+                return None
+
+            # ----------------------------------------------------
+            # OUT OF ORDER
+            # ----------------------------------------------------
+
+            else:
+
+                self.send_ack(
+                    self.expected_sequence
+                )
+
+                print(
+                    f"Out-of-order packet "
+                    f"seq={sequence}, "
+                    f"expected={self.expected_sequence}"
+                )
+
+                return None
+
+        except socket.timeout:
+            return None
+
         except Exception as e:
-            print(f"Receive error: {e}")
-            return None, None, None, None
+
+            print(
+                f"UDP receive error: {e}"
+            )
+
+            return None
+
+    # ------------------------------------------------------------
+    # RECEIVE FILE
+    # ------------------------------------------------------------
 
     def receive_all(self):
-        """Receive all packets until FIN flag"""
-        received_packets = []
+
+        packets = []
+
+        self.expected_sequence = 0
+
+        last_packet_time = time.time()
+
         while True:
-            sequence, ack, flags, payload = self.receive_packet()
-            if sequence is None:
-                break
-            received_packets.append((sequence, payload))
-            if flags is not None and flags & 0x02:  # FIN flag
-                break
-        received_packets.sort(key=lambda x: x[0])
-        return received_packets
+
+            try:
+
+                data, addr = self.sock.recvfrom(
+                    UDP_BUFFER_SIZE + 128
+                )
+
+                if addr != self.server_addr:
+                    continue
+
+                parsed = self.parse_packet(data)
+
+                if parsed is None:
+                    continue
+
+                sequence, ack, flags, payload = parsed
+
+                # Ignore ACK
+                if flags & self.FLAG_ACK:
+                    continue
+
+                # ------------------------------------------------
+                # EXPECTED
+                # ------------------------------------------------
+
+                if sequence == self.expected_sequence:
+
+                    self.send_ack(
+                        sequence + 1
+                    )
+
+                    packets.append(
+                        (
+                            sequence,
+                            payload
+                        )
+                    )
+
+                    print(
+                        f"UDP RECV seq={sequence}, "
+                        f"{len(payload)} bytes"
+                    )
+
+                    self.expected_sequence += 1
+                    last_packet_time = time.time()
+
+                    # FIN
+                    if flags & self.FLAG_FIN:
+
+                        print(
+                            "UDP FIN received"
+                        )
+
+                        break
+
+                # ------------------------------------------------
+                # DUPLICATE
+                # ------------------------------------------------
+
+                elif sequence < self.expected_sequence:
+
+                    self.send_ack(
+                        self.expected_sequence
+                    )
+
+                    print(
+                        f"Duplicate seq={sequence}, "
+                        f"re-ACK={self.expected_sequence}"
+                    )
+
+                # ------------------------------------------------
+                # OUT OF ORDER
+                # ------------------------------------------------
+
+                else:
+
+                    self.send_ack(
+                        self.expected_sequence
+                    )
+
+                    print(
+                        f"Out of order seq={sequence}, "
+                        f"expected={self.expected_sequence}"
+                    )
+
+            except socket.timeout:
+
+                if packets:
+                    if time.time() - last_packet_time > 10:
+                        raise RuntimeError(
+                            "UDP transfer timeout"
+                        )
+
+            except Exception as e:
+
+                print(
+                    f"Receive error: {e}"
+                )
+
+                raise
+
+        packets.sort(
+            key=lambda x: x[0]
+        )
+
+        return packets
+
+    # ------------------------------------------------------------
 
     def close(self):
-        """Close UDP socket"""
-        if self.sock:
-            self.sock.close()
 
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 # ================================================================
 # FTP Client
@@ -341,135 +703,400 @@ class FTPClient:
         print(response)
         return False
 
-    def download(self, remote_file: str, local_file: str = None):
-        """Download file from server"""
+    def download(
+        self,
+        remote_file: str,
+        local_file: str = None
+    ):
+
         if not local_file:
             local_file = remote_file
 
-        # Enter passive mode
-        response = self._send_command("PASV")
+        # ------------------------------------------------------------
+        # PASV
+        # ------------------------------------------------------------
+
+        response = self._send_command(
+            "PASV"
+        )
+
         if not response.startswith("227"):
-            print(f"PASV failed: {response}")
+
+            print(
+                f"PASV failed: {response}"
+            )
+
             return False
 
-        # Parse port from PASV response
         try:
-            # Format: 227 Entering Passive Mode (127,0,0,1,high,low)
+
             port_start = response.find("(") + 1
             port_end = response.find(")")
-            port_info = response[port_start:port_end]
+
+            port_info = response[
+                port_start:port_end
+            ]
+
             parts = port_info.split(",")
-            server_ip = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
-            server_port = int(parts[4]) * 256 + int(parts[5])
+
+            server_ip = (
+                f"{parts[0]}."
+                f"{parts[1]}."
+                f"{parts[2]}."
+                f"{parts[3]}"
+            )
+
+            server_port = (
+                int(parts[4]) * 256
+                + int(parts[5])
+            )
+
         except Exception as e:
-            print(f"Failed to parse PASV response: {e}")
+
+            print(
+                f"PASV parse error: {e}"
+            )
+
             return False
 
-        # Initialize UDP client
-        self.udp_client = ReliableUDPClient()
-        self.udp_client.connect_to_server(server_ip, server_port)
+        # ------------------------------------------------------------
+        # UDP CLIENT
+        # ------------------------------------------------------------
 
-        # Request file transfer
-        response = self._send_command(f"RETR {remote_file}")
-        if not response.startswith("150"):
-            print(f"RETR failed: {response}")
-            return False
-
-        print(f"Downloading {remote_file} to {local_file}...")
-
-        # Receive data via UDP
-        packets = self.udp_client.receive_all()
-
-        # Write to local file
-        with open(local_file, 'wb') as f:
-            for _, payload in packets:
-                f.write(payload)
-
-        print(f"Downloaded {len(packets)} packets, {len(packets) * (UDP_BUFFER_SIZE - 12)} bytes")
-
-        # Check completion
-        response = self._receive_response()
-        print(response)
-
-        self.udp_client.close()
-        return response.startswith("226")
-
-    def upload(self, local_file: str, remote_file: str = None):
-        """Upload file to server"""
-        if not remote_file:
-            remote_file = os.path.basename(local_file)
-
-        if not os.path.exists(local_file):
-            print(f"Local file not found: {local_file}")
-            return False
-
-        # Initialize UDP client
         self.udp_client = ReliableUDPClient()
 
-        # Enter passive mode FIRST to get data port
-        response = self._send_command("PASV")
-        if not response.startswith("227"):
-            print(f"PASV failed: {response}")
-            return False
+        self.udp_client.connect_to_server(
+            server_ip,
+            server_port
+        )
 
-        try:
-            port_start = response.find("(") + 1
-            port_end = response.find(")")
-            port_info = response[port_start:port_end]
-            parts = port_info.split(",")
-            server_ip = f"{parts[0]}.{parts[1]}.{parts[2]}.{parts[3]}"
-            server_port = int(parts[4]) * 256 + int(parts[5])
-        except Exception:
-            print("Failed to parse PASV response")
-            return False
+        # ------------------------------------------------------------
+        # RETR
+        # ------------------------------------------------------------
 
-        self.udp_client.connect_to_server(server_ip, server_port)
+        response = self._send_command(
+            f"RETR {remote_file}"
+        )
 
-        # NOW request upload
-        response = self._send_command(f"STOR {remote_file}")
         if not response.startswith("150"):
-            print(f"STOR failed: {response}")
+
+            print(
+                f"RETR failed: {response}"
+            )
+
+            self.udp_client.close()
+            self.udp_client = None
+
             return False
 
-        print(f"Uploading {local_file} to {remote_file}...")
-
-        # Read and send file data
-        with open(local_file, 'rb') as f:
-            file_data = f.read()
-
-        chunk_size = UDP_BUFFER_SIZE - 12
-        chunks = [file_data[i:i + chunk_size] for i in range(0, len(file_data), chunk_size)]
-
-        for i, chunk in enumerate(chunks):
-            is_last = i == len(chunks) - 1
-
-            flags = 0x04
-
-            if is_last:
-                flags |= 0x02
-
-            if not self.udp_client.send_packet(
-                i,
-                chunk,
-                flags
-            ):
-                print(
-                    f"Upload failed at packet {i}"
-                )
-                return False
+        # Server is now waiting for UDP HELLO.
+        if not self.udp_client.hello():
+            print("UDP handshake failed")
+            self.udp_client.close()
+            self.udp_client = None
+            return False
 
         print(
-            f"Uploaded {len(chunks)} packets"
+            f"Downloading "
+            f"{remote_file}..."
+        )
+
+        # ------------------------------------------------------------
+        # RECEIVE UDP
+        # ------------------------------------------------------------
+
+        try:
+
+            packets = (
+                self.udp_client.receive_all()
+            )
+
+        except Exception as e:
+
+            print(
+                f"UDP download failed: {e}"
+            )
+
+            self.udp_client.close()
+            self.udp_client = None
+
+            return False
+
+        # ------------------------------------------------------------
+        # WRITE FILE
+        # ------------------------------------------------------------
+
+        try:
+
+            with open(
+                local_file,
+                "wb"
+            ) as f:
+
+                total_bytes = 0
+
+                for sequence, payload in packets:
+
+                    if payload:
+
+                        f.write(payload)
+
+                        total_bytes += (
+                            len(payload)
+                        )
+
+        except Exception as e:
+
+            print(
+                f"File write error: {e}"
+            )
+
+            self.udp_client.close()
+            self.udp_client = None
+
+            return False
+
+        print(
+            f"Downloaded "
+            f"{total_bytes} bytes "
+            f"in {len(packets)} UDP packets"
+        )
+
+        # ------------------------------------------------------------
+        # TCP 226
+        # ------------------------------------------------------------
+
+        response = self._receive_response()
+
+        print(
+            f"Server: {response}"
         )
 
         self.udp_client.close()
+        self.udp_client = None
 
-        return True
+        return response.startswith(
+            "226"
+        )
 
-        print(f"Uploaded {len(chunks)} packets")
+    def upload(
+        self,
+        local_file: str,
+        remote_file: str = None
+    ):
+
+        if remote_file is None:
+            remote_file = os.path.basename(
+                local_file
+            )
+
+        if not os.path.isfile(local_file):
+
+            print(
+                f"Local file not found: "
+                f"{local_file}"
+            )
+
+            return False
+
+        # ------------------------------------------------------------
+        # PASV
+        # ------------------------------------------------------------
+
+        response = self._send_command(
+            "PASV"
+        )
+
+        if not response.startswith("227"):
+
+            print(
+                f"PASV failed: {response}"
+            )
+
+            return False
+
+        try:
+
+            start = response.find("(") + 1
+            end = response.find(")")
+
+            parts = response[
+                start:end
+            ].split(",")
+
+            server_ip = (
+                f"{parts[0]}."
+                f"{parts[1]}."
+                f"{parts[2]}."
+                f"{parts[3]}"
+            )
+
+            server_port = (
+                int(parts[4]) * 256
+                + int(parts[5])
+            )
+
+        except Exception as e:
+
+            print(
+                f"PASV parse error: {e}"
+            )
+
+            return False
+
+        # ------------------------------------------------------------
+        # UDP
+        # ------------------------------------------------------------
+
+        self.udp_client = ReliableUDPClient()
+
+        self.udp_client.connect_to_server(
+            server_ip,
+            server_port
+        )
+
+        # ------------------------------------------------------------
+        # STOR
+        # ------------------------------------------------------------
+
+        response = self._send_command(
+            f"STOR {remote_file}"
+        )
+
+        if not response.startswith("150"):
+
+            print(
+                f"STOR failed: {response}"
+            )
+
+            self.udp_client.close()
+            self.udp_client = None
+
+            return False
+
+        # Server is now waiting for UDP HELLO.
+        if not self.udp_client.hello():
+            print("UDP handshake failed")
+            self.udp_client.close()
+            self.udp_client = None
+            return False
+
+        print(
+            f"Uploading "
+            f"{local_file}..."
+        )
+        # ------------------------------------------------------------
+        # READ FILE
+        # ------------------------------------------------------------
+    
+        with open(
+            local_file,
+            "rb"
+        ) as f:
+    
+            file_data = f.read()
+    
+        chunk_size = (
+            UDP_BUFFER_SIZE
+            - ReliableUDPClient.HEADER_SIZE
+        )
+    
+        # ------------------------------------------------------------
+        # EMPTY FILE
+        # ------------------------------------------------------------
+    
+        if len(file_data) == 0:
+    
+            success = (
+                self.udp_client.send_packet(
+                    0,
+                    b"",
+                    ReliableUDPClient.FLAG_DATA
+                    | ReliableUDPClient.FLAG_FIN
+                )
+            )
+    
+            if not success:
+    
+                print(
+                    "Failed to upload empty file"
+                )
+    
+                self.udp_client.close()
+                self.udp_client = None
+    
+                return False
+    
+        # ------------------------------------------------------------
+        # NORMAL FILE
+        # ------------------------------------------------------------
+    
+        else:
+    
+            chunks = [
+                file_data[i:i + chunk_size]
+                for i in range(
+                    0,
+                    len(file_data),
+                    chunk_size
+                )
+            ]
+    
+            for sequence, chunk in enumerate(
+                chunks
+            ):
+    
+                flags = (
+                    ReliableUDPClient.FLAG_DATA
+                )
+    
+                if sequence == len(chunks) - 1:
+    
+                    flags |= (
+                        ReliableUDPClient.FLAG_FIN
+                    )
+    
+                success = (
+                    self.udp_client.send_packet(
+                        sequence,
+                        chunk,
+                        flags
+                    )
+                )
+    
+                if not success:
+    
+                    print(
+                        f"Upload failed at "
+                        f"packet {sequence}"
+                    )
+    
+                    self.udp_client.close()
+                    self.udp_client = None
+    
+                    return False
+    
+        print(
+            f"UDP upload complete: "
+            f"{len(file_data)} bytes"
+        )
+    
         self.udp_client.close()
-        return True
-
+        self.udp_client = None
+    
+        # ------------------------------------------------------------
+        # SERVER 226
+        # ------------------------------------------------------------
+    
+        response = self._receive_response()
+    
+        print(
+            f"Server: {response}"
+        )
+    
+        return response.startswith(
+            "226"
+        )
     def help(self):
         """Show help"""
         print("Available commands:")
@@ -681,13 +1308,13 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Hybrid FTP Client")
     parser.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
-    parser.add_argument("-h", "--host", default=SERVER_HOST, help="Server host")
+    parser.add_argument("-H", "--host", default=SERVER_HOST, help="Server host")
     parser.add_argument("-p", "--port", type=int, default=SERVER_PORT, help="Server port")
     parser.add_argument("-u", "--user", help="Username")
     parser.add_argument("-P", "--password", help="Password")
     parser.add_argument("-c", "--command", help="Execute command and exit")
     parser.add_argument("-d", "--download", help="Download file")
-    parser.add_argument("-u", "--upload", help="Upload file")
+    parser.add_argument("-U", "--upload", help="Upload file")
     args = parser.parse_args()
 
     if args.interactive:
@@ -705,39 +1332,3 @@ if __name__ == "__main__":
             elif args.upload:
                 client.upload(args.upload)
         client.disconnect()
-
-
-# ================================================================
-# Main Entry Point
-# ================================================================
-if __name__ == "__main__":
-    print("Hybrid FTP Client")
-    print("Usage:")
-    print("  python ftp_client.py -i                    # Interactive mode")
-    print("  python ftp_client.py -h <host> -p <port>  # Connect to specific server")
-
-    if len(sys.argv) > 1 and sys.argv[1] == "-i":
-        # Interactive mode
-        cli = InteractiveCLI()
-        cli.run()
-    else:
-        # Direct connection mode
-        host = SERVER_HOST
-        port = SERVER_PORT
-        if len(sys.argv) > 2 and sys.argv[1] == "-h":
-            host = sys.argv[2]
-        if len(sys.argv) > 4 and sys.argv[3] == "-p":
-            port = int(sys.argv[4])
-
-        client = FTPClient(host, port)
-        if client.connect():
-            username = input("Username: ")
-            password = input("Password: ")
-            if client.login(username, password):
-                # Interactive session
-                while True:
-                    command = input("ftp> ").strip()
-                    if command == "quit" or command == "exit":
-                        break
-                    client.send_command(command)
-            client.disconnect()
