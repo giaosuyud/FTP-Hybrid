@@ -1,0 +1,14 @@
+{
+    "admin": {
+        "password": "admin",
+        "home": "admin"
+    },
+    "hnh": {
+        "password": "hnh",
+        "home": "hnh"
+    },
+    "yud": {
+        "password": "ngu",
+        "home": "yud"
+    }
+}
